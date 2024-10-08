@@ -1,3 +1,2 @@
 # AVS-Mamba
-# official code for the AVS-Mamba
-# Our code and model weights will be available
+This is the official code for the AVS-Mamba, our code and model weights will be available soon. 
