@@ -16,6 +16,8 @@ from .cross_scale_temporal_v2 import Layer as MultiscaleTemporalEncoder
 from .cross_scale_temporal import Layer as ScanAblationEncoder
 from .cross_modal_mamba import AudioVisionFusion           # mamba decoder
 
+from .backbone.max_vit import maxvit_base_tf_512
+
 
 class Interpolate(nn.Module):
     def __init__(self, scale_factor, mode, align_corners=False):
@@ -35,20 +37,43 @@ class Interpolate(nn.Module):
 class CompFormer(nn.Module):
     def __init__(self, d_model, vggish_config, audio_dim, num_frame, num_classes, scale_factor, use_vision_backbone, 
                  if_use_encoder, if_use_decoder, use_inter_decoder, use_intra_decoder, use_temporal_encoder, use_spatial_encoder,
-                 if_use_cmfpn, use_temporal_mamba, use_avfusion, scan_order, num_feature_level=3, transformer_feat=[1, 2, 3]):
+                 if_use_cmfpn, use_temporal_mamba, use_avfusion, scan_order, num_feature_level=3, transformer_feat=[1, 2, 3], img_size=224):
         super().__init__()
         self.audio_backbone = VGGish(**vggish_config)
         
+        # 推理阶段如下代码已经不重要了，因为在推理阶段所有的模型权重都会重新加载一遍
         if use_vision_backbone == "PVTv2":
             input_shape = {'channel': [64, 128, 320, 512], 'stride': [4, 8, 16, 32]}
             self.vision_backbone = pvt_v2_b5(init_weights_path='/bin/pretrained_backbones/pvt_v2_b5.pth')
         elif use_vision_backbone == "ResNet50":
             input_shape = {'channel': [256, 512, 1024, 2048], 'stride': [4, 8, 16, 32]}
             self.vision_backbone = B2_ResNet(init_weights_path='/bin/pretrained_backbones/resnet50-19c8e357.pth')
+        elif use_vision_backbone == "VMamba":
+            from .VMamba.vmamba import Backbone_VSSM
+            input_shape = {'channel': [128, 256, 512, 1024], 'stride': [4, 8, 16, 32]}
+            self.vision_backbone = Backbone_VSSM(pretrained='model/VMamba/vssm_base_0229_ckpt_epoch_237.pth', 
+                                                depths=[2, 2, 15, 2], dims=128, drop_path_rate=0.6, 
+                                                patch_size=4, in_chans=3, num_classes=1000, 
+                                                ssm_d_state=1, ssm_ratio=2.0, ssm_dt_rank="auto", ssm_act_layer="silu",
+                                                ssm_conv=3, ssm_conv_bias=False, ssm_drop_rate=0.0, 
+                                                ssm_init="v0", forward_type="v05_noz", 
+                                                mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+                                                patch_norm=True, norm_layer=("ln2d"), 
+                                                downsample_version="v3", patchembed_version="v2", 
+                                                use_checkpoint=False, posembed=False, imgsize=512)
+        elif use_vision_backbone == "Vim":
+            from .vim.backbone import VisionMamba
+            input_shape = {'channel': [768, 768, 768, 768], 'stride': [4, 8, 16, 32]}
+            self.vision_backbone = VisionMamba(img_size=img_size, patch_size=16, embed_dim=768, depth=24, if_fpn=False, pretrained='model/vim/vim_b_midclstok_81p9acc.pth')
+            # self.vision_backbone = vim_base_patch16_224_bimambav2_final_pool_mean_abs_pos_embed_with_middle_cls_token_div2(pretrained=True)
+        elif use_vision_backbone == "MaxVit":
+            input_shape = {'channel': [96, 192, 384, 768], 'stride': [4, 8, 16, 32]}
+            self.vision_backbone = maxvit_base_tf_512(pretrained=True)
         else:
-            raise ValueError("The vision backbone can only be PVTv2 or ResNet50")
+            raise ValueError("The vision backbone can only be PVTv2, ResNet50 or VMamba")
         
-        self.vision_backbone_frozen(frozen=False)
+        self.use_vision_backbone = use_vision_backbone
+        self.vision_backbone_frozen(unfrozen=False)
         for param in self.audio_backbone.parameters():
             param.requires_grad = False
             
@@ -184,27 +209,25 @@ class CompFormer(nn.Module):
             nn.Conv2d(32, num_classes, kernel_size=1, stride=1, padding=0, bias=False)
         )
         
-    def vision_backbone_frozen(self, frozen=False):
+    def vision_backbone_frozen(self, unfrozen=False):
         for param in self.vision_backbone.parameters():
-            param.requires_grad = frozen
+            param.requires_grad = unfrozen
 
-    def forward(self, audio_feat, vision_feat, target_mask):
+    def forward(self, audio_feat, vision_feat):
         with torch.no_grad():
             audio_feat = self.audio_backbone(audio_feat)
         audio_feat = self.audio_proj(audio_feat)        # bs * T, dim
 
         vision_feat = self.vision_backbone(vision_feat)
         # res2层特征图，不参与deformable attn 计算，和音频进行两次特征交互
+        if self.use_vision_backbone == 'MaxVit':
+            vision_feat = vision_feat[1: ]
         mask_feature = self.input_proj[0](vision_feat[0])   # bs * T, dim, h, w
         mask = torch.zeros((mask_feature.size(0), mask_feature.size(2), mask_feature.size(3)), device=mask_feature.device, dtype=torch.bool)
         # mask_feature = rearrange(mask_feature, 'bt c h w -> bt h w c')
         audio_feature = rearrange(audio_feat, '(b t) c -> b t c', t=self.num_frame)
         audio_feat = rearrange(audio_feat, '(b t) c -> b t c', t=self.num_frame)
         num_frame = audio_feat.shape[1]
-        # audio_feat = self.vision_to_audio_fusion(mask_feature, audio_feat, self.num_frame)
-        # mask_feature = self.audio_to_vision_fusion(mask_feature, audio_feature, self.num_frame)
-        # mask_feature = rearrange(mask_feature, 'bt h w c -> bt c h w')      # (b t) c h w
-        # res2_pos_embed = rearrange(pos_embed, '(t h w) b c -> (b t) c h w', t=self.num_frame, h=h, w=w)
         
         srcs = []
         masks = []
