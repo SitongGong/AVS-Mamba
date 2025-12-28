@@ -16,8 +16,6 @@ from .cross_scale_temporal_v2 import Layer as MultiscaleTemporalEncoder
 from .cross_scale_temporal import Layer as ScanAblationEncoder
 from .cross_modal_mamba import AudioVisionFusion           # mamba decoder
 
-from .backbone.max_vit import maxvit_base_tf_512
-
 
 class Interpolate(nn.Module):
     def __init__(self, scale_factor, mode, align_corners=False):
@@ -66,9 +64,6 @@ class CompFormer(nn.Module):
             input_shape = {'channel': [768, 768, 768, 768], 'stride': [4, 8, 16, 32]}
             self.vision_backbone = VisionMamba(img_size=img_size, patch_size=16, embed_dim=768, depth=24, if_fpn=False, pretrained='model/vim/vim_b_midclstok_81p9acc.pth')
             # self.vision_backbone = vim_base_patch16_224_bimambav2_final_pool_mean_abs_pos_embed_with_middle_cls_token_div2(pretrained=True)
-        elif use_vision_backbone == "MaxVit":
-            input_shape = {'channel': [96, 192, 384, 768], 'stride': [4, 8, 16, 32]}
-            self.vision_backbone = maxvit_base_tf_512(pretrained=True)
         else:
             raise ValueError("The vision backbone can only be PVTv2, ResNet50 or VMamba")
         
