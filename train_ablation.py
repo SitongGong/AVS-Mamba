@@ -4,7 +4,7 @@ import torch.nn
 import os
 import random
 import numpy as np
-# from mmcv import Config
+# from x import Config
 import argparse
 
 import logging
@@ -24,6 +24,7 @@ from torch.utils.tensorboard import SummaryWriter
 import cv2
 import torch.nn.functional as F
 from einops import rearrange
+
 
 def getLogger(log_file, name, fmt='%(asctime)s %(levelname)s ==> %(message)s'):
     logger = logging.getLogger(name)
@@ -52,11 +53,8 @@ def train(args):
 
     # logger
     log_name = time.strftime('%Y%m%d-%H%M%S', time.localtime())
-    # dir_name = os.path.splitext(os.path.split(args.cfg)[-1])[0]
-    if not os.path.exists(args.log_dir):
-        os.mkdir(args.log_dir)
-    if not os.path.exists(os.path.join(args.log_dir, args.dir_name)):
-        os.mkdir(os.path.join(args.log_dir, args.dir_name))
+    os.makedirs(os.path.join(args.log_dir), exist_ok=True)
+    os.makedirs(os.path.join(args.log_dir, args.dir_name), exist_ok=True)
     log_file = os.path.join(args.log_dir, args.dir_name, f'{log_name}.log')
     logger = getLogger(log_file, __name__)
     # logger.info(f'Load config from {args.cfg}')
@@ -79,6 +77,7 @@ def train(args):
         args.use_intra_decoder, args.use_spatial_encoder, args.if_use_cmfpn, args.use_avfusion, \
             args.use_temporal_mamba, args.use_temporal_encoder
         )
+    
     model = CompFormer(d_model=args.d_model, 
                        vggish_config=vggish, 
                        audio_dim=128,
@@ -95,18 +94,31 @@ def train(args):
                        if_use_cmfpn=args.if_use_cmfpn, 
                        use_temporal_mamba=args.use_temporal_mamba, 
                        use_avfusion=args.use_avfusion, 
-                       scan_order=args.scan_order)
+                       scan_order=args.scan_order,
+                       img_size=args.img_size)
+    
     if args.resume:     # 加载之前的训练模型
         model_dict = model.state_dict()
         model_weight = torch.load(args.model_weight, map_location='cpu')
         state_dict = {k: v for k, v in model_dict.items() if k not in model_weight.keys()}
-        print(state_dict)          # 打印出模型中存在但是预训练权重中不存在的结构
+        # print(state_dict)          # 打印出模型中存在但是预训练权重中不存在的结构
         logger.info("Module in the original model: " + str([key for key in state_dict.keys()]))
         
         state_dict = {k: v for k, v in model_weight.items() if k not in model_dict.keys()}
-        print(state_dict)          # 打印出预训练权重中存在但是模型中不存在的结构
+        # print(state_dict)          # 打印出预训练权重中存在但是模型中不存在的结构
         logger.info("Module in the pre-trained model: " + str([key for key in state_dict.keys()]))
         
+        if args.use_vision_backbone == 'Vim':
+            if args.img_size != 512:      # 由于之前的模型权重是在 512 * 512 的图像上训练的，所以需要对权重进行调整
+                for key in model_weight.keys():
+                    if key == 'vision_backbone.pos_embed':
+                        # 这里对pos_embed进行插值操作
+                        pos_tokens = model_weight['vision_backbone.pos_embed']# [:, num_extra_tokens:]
+                        embedding_size = pos_tokens.shape[-1]
+                        pos_tokens = pos_tokens.view(-1, int(pos_tokens.shape[1] ** 0.5), int(pos_tokens.shape[1] ** 0.5), embedding_size).permute(0, 3, 1, 2)
+                        new_pos_embed = F.interpolate(pos_tokens, size=(args.img_size // args.scale_factor, args.img_size // args.scale_factor), mode='bicubic', align_corners=False).permute(0, 2, 3, 1).flatten(1, 2)
+                        model_weight['vision_backbone.pos_embed'] = new_pos_embed
+    
         model.load_state_dict(model_weight, strict=False)
     model = torch.nn.DataParallel(model).cuda()       # 分布式训练Missing key(s) in state_dict: "visual_fusion_block.multihead_attn.in_proj_weight", "visual_fusion_block.multihead_attn.in_proj_bias", "visual_fusion_block.multihead_attn.out_proj.weight", "visual_fusion_block.multihead_attn.out_proj.bias", "mta_layer.cross_attn_layer.cross_attn.in_proj_weight", "mta_layer.cross_attn_layer.cross_attn.in_proj_bias", "mta_layer.cross_attn_layer.cross_attn.out_proj.weight", "mta_layer.cross_attn_layer.cross_attn.out_proj.bias", "mta_layer.cross_attn_layer.norm1.weight", "mta_layer.cross_attn_layer.norm1.bias", "mta_layer.ffn.linear1.weight", "mta_layer.ffn.linear1.bias", "mta_layer.ffn.linear2.weight", "mta_layer.ffn.linear2.bias", "mta_layer.ffn.norm2.weight", "mta_layer.ffn.norm2.bias", "mta_layer.cross_attn_layers.0.cross_attn.in_proj_weight", "mta_layer.cross_attn_layers.0.cross_attn.in_proj_bias", "mta_layer.cross_attn_layers.0.cross_attn.out_proj.weight", "mta_layer.cross_attn_layers.0.cross_attn.out_proj.bias", "mta_layer.cross_attn_layers.0.norm1.weight", "mta_layer.cross_attn_layers.0.norm1.bias", "mta_layer.ffn_layers.0.linear1.weight", "mta_layer.ffn_layers.0.linear1.bias", "mta_layer.ffn_layers.0.linear2.weight", "mta_layer.ffn_layers.0.linear2.bias", "mta_layer.ffn_layers.0.norm2.weight", "mta_layer.ffn_layers.0.norm2.bias".
     model.train()
@@ -115,7 +127,7 @@ def train(args):
     # dataset
     # train_dataset = build_dataset(args.dataset, 'train', args)
     if args.session_name == 'MS3':
-        train_dataset = MS3Dataset(split='train', cfg=args)
+        train_dataset = MS3Dataset(split='train', img_size=args.img_size, cfg=args)
         train_dataloader = torch.utils.data.DataLoader(train_dataset,
                                                     batch_size=args.train_batch_size,
                                                     shuffle=True,
@@ -124,7 +136,7 @@ def train(args):
         max_step = (len(train_dataset) // args.train_batch_size) * args.train_epochs
 
         # val_dataset = build_dataset(args.dataset, 'test', args)
-        val_dataset = MS3Dataset(split='test', cfg=args)
+        val_dataset = MS3Dataset(split='test', img_size=args.img_size, cfg=args)
         val_dataloader = torch.utils.data.DataLoader(val_dataset,
                                                     batch_size=args.val_batch_size,
                                                     shuffle=False,
@@ -132,7 +144,7 @@ def train(args):
                                                     pin_memory=True)
     elif args.session_name == 'S4':
         # train_dataset = build_dataset(args.dataset, 'train', args)
-        train_dataset = S4Dataset(split='train', cfg=args)
+        train_dataset = S4Dataset(split='train', img_size=args.img_size, cfg=args)
         train_dataloader = torch.utils.data.DataLoader(train_dataset,
                                                     batch_size=args.train_batch_size,
                                                     shuffle=True,
@@ -141,7 +153,7 @@ def train(args):
         max_step = (len(train_dataset) // args.train_batch_size) * args.train_epochs
 
         # val_dataset = build_dataset(args.dataset, 'test', args)
-        val_dataset = S4Dataset(split='test', cfg=args)
+        val_dataset = S4Dataset(split='test', img_size=args.img_size, cfg=args)
         val_dataloader = torch.utils.data.DataLoader(val_dataset,
                                                     batch_size=args.val_batch_size,
                                                     shuffle=False,
@@ -165,7 +177,7 @@ def train(args):
     if not args.eval_only:
         for epoch in range(args.train_epochs):
             if epoch == args.unfreeze_epoch:
-                model.module.vision_backbone_frozen(frozen=True)
+                model.module.vision_backbone_frozen(unfrozen=True)
             total_loss = 0
             for n_iter, batch_data in enumerate(train_dataloader):
                 if args.session_name == 'MS3':
@@ -184,7 +196,7 @@ def train(args):
                 imgs = imgs.view(B * frame, C, H, W)
                 mask = mask.view(B * mask_num, 1, H, W)
                 audio = audio.view(-1, audio.shape[2], audio.shape[3], audio.shape[4])
-                pred_mask, mask_features = model(audio, imgs, mask.reshape(B, mask_num, H, W))       # pred_mask: l, bs * t, 1, h, w     mask_features: bs * t, c, h, w
+                pred_mask, mask_features = model(audio, imgs)       # pred_mask: l, bs * t, 1, h, w     mask_features: bs * t, c, h, w
                 loss, loss_dict = loss(pred_mask, mask, weight_dict, mask_features)
                 loss_util.add_loss(loss, loss_dict)          # 保存并记录每个batch的loss值
                 optimizer.zero_grad()
@@ -210,7 +222,7 @@ def train(args):
                         imgs, audio, mask, _ = batch_data
                     elif args.session_name == 'S4':
                         imgs, audio, mask, _, _ = batch_data
-
+            
                     imgs = imgs.cuda()
                     audio = audio.cuda()
                     mask = mask.cuda()
@@ -220,8 +232,9 @@ def train(args):
                     audio = audio.view(-1, audio.shape[2], audio.shape[3], audio.shape[4])
 
                     # [bs*5, 1, 224, 224]
-                    output, _ = model(audio, imgs, mask.reshape(B, frame, H, W))
+                    output, _ = model(audio, imgs)
                     output = output[-1]          # bs * t, 1, h, w
+                    output = F.interpolate(output, size=(H, W), mode='bilinear', align_corners=False)
                     miou = mask_iou(output.squeeze(1), mask)             # 计算miou值     bs * t, h, w
                     Fscore = Eval_Fmeasure(output.squeeze(1), mask)
                     avg_meter_miou.add({'miou': miou})
@@ -272,8 +285,9 @@ def train(args):
                 audio = audio.view(-1, audio.shape[2], audio.shape[3], audio.shape[4])
 
                 # [bs*5, 1, 224, 224]
-                output, _ = model(audio, imgs, mask.reshape(B, frame, H, W))
+                output, _ = model(audio, imgs)
                 output = output[-1]          # bs * t, 1, h, w
+                output = F.interpolate(output, size=(H, W), mode='bilinear', align_corners=False)
                 miou = mask_iou(output.squeeze(1), mask)             # 计算miou值     bs * t, h, w
                 Fscore = Eval_Fmeasure(output.squeeze(1), mask)
 
@@ -334,16 +348,18 @@ def train(args):
             logger.info(f'test F_score: {Fscore}')
             logger.info('test miou: {}, F_score: {}'.format(miou.item(), Fscore))
 
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--log_dir', type=str, default='ms3_avs_mamba', help='log dir')
-    parser.add_argument('--dir_name', type=str, default='avs', help='log dir name')
-    parser.add_argument('--checkpoint_dir', type=str, default='ms3_avs_mamba', help='dir to save checkpoints')
+    parser.add_argument('--log_dir', type=str, default='work_dirs_vmamba/ms3', help='log dir')
+    parser.add_argument('--dir_name', type=str, default='avs_ms3', help='log dir name')
+    parser.add_argument('--checkpoint_dir', type=str, default='work_dirs_vmamba/ms3', help='dir to save checkpoints')
     parser.add_argument("--session_name", default='MS3', type=str, help="the MS3 setting")
     parser.add_argument('--vision_pretrained', help='dir to vision checkpoints', 
                         default='pretrained_backbones/pvt_v2_b5.pth', type=str)
+    parser.add_argument('--img_size', default=512, type=int)
                         
-    parser.add_argument('--use_vision_backbone', default='PVTv2', type=str)
+    parser.add_argument('--use_vision_backbone', default='Vim', type=str)
     parser.add_argument('--lr', help='learning rate', default=2e-5, type=float)        # 原来是2e-5, no weight decay
     parser.add_argument('--audio_pretrained', help='dir to audio checkpoints', 
                         default='/bin/pretrained_backbones/vggish-10086976.pth', type=str)
@@ -352,7 +368,7 @@ if __name__ == '__main__':
     parser.add_argument('--visualize', default=False, type=bool)
 
     parser.add_argument('--train_epochs', default=120, type=int)
-    parser.add_argument('--train_batch_size', default=2, type=int)
+    parser.add_argument('--train_batch_size', default=4, type=int)
     parser.add_argument('--val_batch_size', default=1, type=int)
     parser.add_argument('--num_works', default=8, type=int)
     parser.add_argument('--loss_type', default='dice', type=str)
